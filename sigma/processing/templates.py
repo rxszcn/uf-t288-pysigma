@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from copy import deepcopy
 import datetime
 import importlib.util
 import os
@@ -251,6 +252,26 @@ class TemplateBase:
         if self.policy is not None and self.policy.allow_template_vars:
             return True
         return os.environ.get(PYSIGMA_ALLOW_VARS_EXECUTION_ENV, "").lower() in ("1", "true")
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "TemplateBase":
+        """
+        Reconstruct instead of copying the derived Jinja2 template.
+
+        ``j2template`` (and its environment) is a runtime object built from the dataclass
+        configuration fields in ``__post_init__`` and is not deep-copyable (Jinja2's
+        ``Template.__new__`` rejects the copy protocol). When a pipeline containing a template
+        transformation/finalizer is merged, processing items are deep-copied; rebuilding the
+        template from the copied configuration yields an independent, fully functional copy while
+        sharing the stateless policy object supplied through *memo*.
+        """
+        import dataclasses
+
+        kwargs = {
+            field.name: deepcopy(getattr(self, field.name), memo)
+            for field in dataclasses.fields(self)
+            if field.init
+        }
+        return self.__class__(**kwargs)
 
     def _load_vars_from_file(self, vars_path: str) -> Any:
         """Load variables and functions from a Python file.

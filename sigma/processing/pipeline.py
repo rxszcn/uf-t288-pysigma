@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
 import hashlib
@@ -1010,9 +1011,95 @@ class ProcessingPipeline:
             return False
         return processing_item_id in self.field_name_applied_ids[field]
 
+    @staticmethod
+    def _seed_shared_engines(item: Any, memo: dict[int, Any]) -> None:
+        """
+        Add regex engines already cached inside an operand item to the deepcopy *memo* so that they
+        are shared instead of being deep-copied.
+
+        A :class:`~sigma.policy.regex_engine.RegexEngine` is a stateless singleton-like object; the
+        RE2 implementation holds a back-reference to the underlying ``re2`` module, which cannot be
+        deep-copied. Engines become reachable not only through an attached ``SigmaPolicy`` (seeded
+        separately) but also through the lazily populated ``_re_engine`` regex cache on
+        transformations and conditions, including those nested inside a NestedProcessingTransformation.
+        Only the well-known cache attribute is inspected, so arbitrary objects are never traversed.
+        """
+        from sigma.policy.regex_engine import RegexEngine
+
+        transformation = getattr(item, "transformation", None)
+        candidates: list[Any] = [transformation]
+        # Nested transformations/postprocessing keep a private nested pipeline whose items may
+        # carry their own lazily compiled regex caches.
+        nested_pipeline = getattr(transformation, "_nested_pipeline", None)
+        if nested_pipeline is not None:
+            candidates.extend(nested_pipeline.items)
+            candidates.extend(nested_pipeline.postprocessing_items)
+        for condition_collection_name in (
+            "rule_conditions",
+            "detection_item_conditions",
+            "field_name_conditions",
+        ):
+            conditions = getattr(item, condition_collection_name, None)
+            if isinstance(conditions, dict):
+                candidates.extend(conditions.values())
+            elif isinstance(conditions, (list, tuple)):
+                candidates.extend(conditions)
+        for candidate in candidates:
+            engine = getattr(candidate, "_re_engine", None)
+            if isinstance(engine, RegexEngine) and id(engine) not in memo:
+                memo[id(engine)] = engine
+
+    def _detached_copy(self, items: list[Any], memo: dict[int, Any] | None = None) -> list[Any]:
+        """
+        Deep-copy processing items (or postprocessing items/finalizers) for inclusion into a
+        merged pipeline and detach every pipeline binding from the copies.
+
+        Merging must never move the original items out of their operand pipelines: each
+        transformation/condition keeps a back-reference (``_pipeline``) to the pipeline it belongs
+        to, and field mapping tracking as well as pipeline state are written through that
+        reference. Reusing the same item instances in the merged pipeline would therefore rebind
+        them to the merged pipeline, leaving the operand pipeline's tracking silently empty when it
+        is later applied on its own while the field conversion itself still looks correct. The
+        detached copies are rebound to the merged pipeline by its ``__post_init__``/``set_pipeline``
+        hook, while the operand pipelines keep their original items and bindings untouched.
+
+        Two kinds of stateless, non-copyable collaborators are shared through the deepcopy memo
+        rather than copied:
+
+        * ``SigmaPolicy`` objects -- configuration the merged pipeline deliberately runs on as one
+          effective policy (seeded by the caller).
+        * ``RegexEngine`` objects -- stateless engines reachable through policies and through the
+          lazily populated regex caches of transformations and conditions; the RE2 engine holds a
+          back-reference to the ``re2`` module and is not deep-copyable.
+
+        The caller is responsible for seeding *memo* with the operand pipelines' policies; engines
+        reachable only via item-local caches are seeded here on demand.
+        """
+        if memo is None:
+            memo = dict()
+        copied_items: list[Any] = []
+        for item in items:
+            self._seed_shared_engines(item, memo)
+            item_copy = deepcopy(item, memo)
+            # Processing items, postprocessing items and conditions expose _clear_pipeline();
+            # finalizers only carry the plain _pipeline attribute and are cleared directly.
+            clear_pipeline = getattr(item_copy, "_clear_pipeline", None)
+            if callable(clear_pipeline):
+                clear_pipeline()
+            else:
+                item_copy._pipeline = None
+            copied_items.append(item_copy)
+        return copied_items
+
     def __add__(self, other: "ProcessingPipeline" | None) -> "ProcessingPipeline":
         """
         Concatenate two processing pipelines and merge their variables.
+
+        The merged pipeline is built from deep copies of the operand pipelines' items. The operand
+        pipelines themselves are not mutated and remain independently usable after the merge:
+        their processing items stay bound to them, so a later standalone application still records
+        field mappings in their own tracking objects. Bindings of the copied items are detached
+        first and then re-established against the merged pipeline while it is constructed.
 
         **Note:** This method concatenates pipelines in the order specified and does NOT respect
         pipeline priorities. For combining multiple pipelines with different priority values,
@@ -1054,14 +1141,27 @@ class ProcessingPipeline:
         else:
             merged_policy = self.policy or other.policy
 
-        self._clear_pipeline()
-        other._clear_pipeline()
+        # Share stateless policy objects (and their non-copyable regex engine) across all copies.
+        copy_memo: dict[int, Any] = {}
+        for policy in (self.policy, other.policy):
+            if policy is not None and id(policy) not in copy_memo:
+                copy_memo[id(policy)] = policy
+        # Also share the effective engines themselves: a pipeline without an explicit policy runs
+        # transformations against the global default policy's engine, which is reachable only via
+        # the regex caches and would otherwise hit the non-deep-copyable re2 module back-reference.
+        for pipeline in (self, other):
+            engine = pipeline.resolve_policy().regex_engine
+            if id(engine) not in copy_memo:
+                copy_memo[id(engine)] = engine
 
         return self.__class__(
-            items=self.items + other.items,
-            postprocessing_items=self.postprocessing_items + other.postprocessing_items,
-            finalizers=self.finalizers + other.finalizers,
-            vars={**self.vars, **other.vars},
+            items=self._detached_copy(self.items, copy_memo)
+            + self._detached_copy(other.items, copy_memo),
+            postprocessing_items=self._detached_copy(self.postprocessing_items, copy_memo)
+            + self._detached_copy(other.postprocessing_items, copy_memo),
+            finalizers=self._detached_copy(self.finalizers, copy_memo)
+            + self._detached_copy(other.finalizers, copy_memo),
+            vars={**deepcopy(self.vars), **deepcopy(other.vars)},
             policy=merged_policy,
         )
 

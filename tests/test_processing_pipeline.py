@@ -1663,3 +1663,122 @@ def test_processingitem_set_pipeline_twice():
     item.set_pipeline(pipeline)
     with pytest.raises(SigmaProcessingItemError, match="Pipeline.*already set"):
         item.set_pipeline(pipeline)
+
+
+# ---------------------------------------------------------------------------
+# Regression coverage: operand pipelines must stay independently usable after
+# being merged. Merging used to detach their items and rebind the shared item
+# instances to the merged pipeline, so a later standalone application recorded
+# field mappings in the merged pipeline's tracking and left the operand's own
+# ledger silently empty even though the field conversion still looked correct.
+# ---------------------------------------------------------------------------
+
+
+def _rule_field_names(rule: SigmaRule) -> list[str | None]:
+    return [
+        detection_item.field
+        for detection_item in rule.detection.detections["sel"].detection_items
+    ]
+
+
+def _merge_reuse_pipelines() -> tuple[ProcessingPipeline, ProcessingPipeline, ProcessingPipeline]:
+    """In-memory field normalization pipeline, platform pipeline and their merged result."""
+    field_normalization_pipeline = ProcessingPipeline(
+        name="field-normalization",
+        items=[
+            ProcessingItem(
+                identifier="field_normalization_mapping",
+                transformation=FieldMappingTransformation({"fieldA": "mappedA"}),
+            )
+        ],
+    )
+    platform_pipeline = ProcessingPipeline(
+        name="platform",
+        items=[
+            ProcessingItem(
+                identifier="platform_prefix",
+                transformation=AddFieldnamePrefixTransformation("winlog."),
+            )
+        ],
+    )
+    merged_pipeline = field_normalization_pipeline + platform_pipeline
+    return field_normalization_pipeline, platform_pipeline, merged_pipeline
+
+
+def _merge_reuse_rule_yaml() -> str:
+    return """
+        title: Test
+        status: test
+        logsource:
+            category: test
+        detection:
+            sel:
+                fieldA: valueA
+                fieldB: valueB
+            condition: sel
+    """
+
+
+def test_processingpipeline_merge_keeps_operand_ledger_on_reuse():
+    """An operand pipeline reused standalone after a merge records mappings in its own ledger."""
+    field_pipeline, _platform_pipeline, merged_pipeline = _merge_reuse_pipelines()
+
+    # The merged pipeline keeps working and keeps its own combined ledger semantics.
+    merged_rule = merged_pipeline.apply(SigmaRule.from_yaml(_merge_reuse_rule_yaml()))
+    assert _rule_field_names(merged_rule) == ["winlog.mappedA", "winlog.fieldB"]
+
+    # Reusing the operand pipeline on another batch must convert identically to pre-merge
+    # behavior and record the field mapping in the operand pipeline's own tracking object.
+    reused_rule = field_pipeline.apply(SigmaRule.from_yaml(_merge_reuse_rule_yaml()))
+    assert _rule_field_names(reused_rule) == ["mappedA", "fieldB"]
+    assert len(field_pipeline.field_mappings) == 1
+    assert dict(field_pipeline.field_mappings) == {"fieldA": {"mappedA"}}
+
+    # The operand item is still bound to its own pipeline, never to the merged pipeline.
+    assert field_pipeline.items[0]._pipeline is field_pipeline
+    assert merged_pipeline.items[0] is not field_pipeline.items[0]
+
+
+def test_processingpipeline_merge_behavior_and_ledger_unchanged():
+    """The merged pipeline's conversion, ordering and ledger semantics stay unchanged."""
+    field_pipeline, platform_pipeline, merged_pipeline = _merge_reuse_pipelines()
+
+    assert [item.identifier for item in merged_pipeline.items] == [
+        "field_normalization_mapping",
+        "platform_prefix",
+    ]
+    merged_rule = merged_pipeline.apply(SigmaRule.from_yaml(_merge_reuse_rule_yaml()))
+    assert _rule_field_names(merged_rule) == ["winlog.mappedA", "winlog.fieldB"]
+    assert dict(merged_pipeline.field_mappings) == {
+        "fieldA": {"winlog.mappedA"},
+        "mappedA": {"winlog.mappedA"},
+        "fieldB": {"winlog.fieldB"},
+    }
+    # Building the merged pipeline must not mutate either operand pipeline's bindings.
+    assert field_pipeline.items[0]._pipeline is field_pipeline
+    assert platform_pipeline.items[0]._pipeline is platform_pipeline
+
+
+def test_processingpipeline_single_without_merge_behavior_unchanged():
+    """A single pipeline that never participates in a merge behaves exactly as before."""
+    field_pipeline, _platform_pipeline, _merged_pipeline = _merge_reuse_pipelines()
+    # Build an equivalent standalone pipeline that is not part of any merge as control group.
+    standalone_pipeline = ProcessingPipeline(
+        name="standalone-field-normalization",
+        items=[
+            ProcessingItem(
+                identifier="field_normalization_mapping",
+                transformation=FieldMappingTransformation({"fieldA": "mappedA"}),
+            )
+        ],
+    )
+
+    reused_rule = field_pipeline.apply(SigmaRule.from_yaml(_merge_reuse_rule_yaml()))
+    standalone_rule = standalone_pipeline.apply(SigmaRule.from_yaml(_merge_reuse_rule_yaml()))
+
+    assert _rule_field_names(reused_rule) == _rule_field_names(standalone_rule) == [
+        "mappedA",
+        "fieldB",
+    ]
+    assert dict(field_pipeline.field_mappings) == dict(standalone_pipeline.field_mappings)
+    assert len(field_pipeline.field_mappings) == len(standalone_pipeline.field_mappings) == 1
